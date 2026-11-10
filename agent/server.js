@@ -289,32 +289,12 @@ function createResearchTools(job) {
     },
   });
 
-  const updateSiteTool = tool({
-    name: 'update_site',
-    description: 'Save one fully checked opportunity to the private Supabase opportunities table. Call once for each verified opportunity you intend to keep. Duplicate URLs are skipped.',
-    parameters: OpportunitySchema,
-    async execute(opportunity) {
-      if (!isCheckedOpportunity(job, opportunity)) {
-        return JSON.stringify({ saved: false, error: 'Opportunity has not passed all official-source checks.' });
-      }
-      try {
-        const outcome = await updateSite(opportunity);
-        job.savedUrls.add(outcome.url);
-        return JSON.stringify(outcome);
-      } catch (error) {
-        const message = safeError(error);
-        console.error(JSON.stringify({ event: 'opportunity_save_failed', title: opportunity.title, error: message }));
-        return JSON.stringify({ saved: false, error: message });
-      }
-    },
-  });
-
-  return [searchTool, openPageTool, updateSiteTool];
+  return [searchTool, openPageTool];
 }
 
 function safeError(error) {
   let message = error instanceof Error ? error.message : String(error);
-  for (const secret of [process.env.OPENAI_API_KEY, process.env.AGENT_SECRET, process.env.SUPABASE_SERVICE_KEY]) {
+  for (const secret of [process.env.OPENAI_API_KEY, process.env.AGENT_SECRET]) {
     if (secret) message = message.split(secret).join('[redacted]');
   }
   return message.slice(0, 500);
@@ -348,54 +328,6 @@ function isCheckedOpportunity(job, item) {
   return item.ageEvidence.status === 'verified' && excerptWasRead(job, item.ageEvidence)
     && item.locationEvidence.status === 'verified' && excerptWasRead(job, item.locationEvidence)
     && item.availabilityEvidence.status === 'open' && excerptWasRead(job, item.availabilityEvidence);
-}
-
-async function updateSite(item) {
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_KEY;
-  if (!supabaseUrl || !serviceKey) throw new Error('SUPABASE_URL and SUPABASE_SERVICE_KEY must be set to save opportunities.');
-
-  const url = new URL(item.availabilityEvidence.sourceUrl).toString();
-  const row = {
-    title: item.title,
-    url,
-    source_excerpt: [
-      `Age eligibility: ${item.ageEvidence.excerpt}`,
-      `Location: ${item.locationEvidence.excerpt}`,
-      `Availability: ${item.availabilityEvidence.excerpt}`,
-    ].join('\n'),
-    why_it_fits: item.whyItFits,
-    status: 'new',
-  };
-  const endpoint = `${supabaseUrl.replace(/\/+$/, '')}/rest/v1/opportunities?on_conflict=url`;
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      apikey: serviceKey,
-      authorization: `Bearer ${serviceKey}`,
-      'content-type': 'application/json',
-      prefer: 'resolution=ignore-duplicates,return=representation',
-    },
-    body: JSON.stringify(row),
-  });
-  const responseBody = await response.text();
-  if (!response.ok) {
-    let detail = `HTTP ${response.status}`;
-    try {
-      const payload = JSON.parse(responseBody);
-      detail += payload.code ? ` (${payload.code})` : '';
-      if (payload.message) detail += `: ${payload.message}`;
-    } catch {
-      // Keep response details out of logs when the gateway returns non-JSON.
-    }
-    throw new Error(`Supabase update_site failed: ${detail}`);
-  }
-
-  const inserted = responseBody ? JSON.parse(responseBody) : [];
-  const saved = Array.isArray(inserted) && inserted.length > 0;
-  const outcome = { saved, url, title: item.title, ...(saved ? { id: inserted[0].id } : {}) };
-  console.log(JSON.stringify({ event: saved ? 'opportunity_saved' : 'opportunity_duplicate_skipped', ...outcome }));
-  return outcome;
 }
 
 function validateFinalOutput(job, value) {
@@ -444,7 +376,7 @@ async function runResearch(job, profile) {
         'Verify age eligibility, geographic eligibility for the profile city, and that application/registration is open now or the event is upcoming. Missing evidence is not proof of eligibility. Exclude any candidate for which any criterion is unclear.',
         'When evidence is missing or an official source cannot be read, investigate with another search or official page before ruling the candidate out, until the tool budget is exhausted.',
         'Only use short, exact excerpts copied from the official page text. Give a source URL for each age, location, and availability excerpt.',
-        'After verifying an opportunity and deciding to keep it, call update_site once with its full evidence before returning it. Never call update_site for an unverified or ruled-out candidate.',
+        'Return fully verified opportunities directly in the structured output. Do not save them to any website or database.',
         'Never invent opportunities, dates, eligibility rules, deadlines, or openings. Return fewer than five when evidence is insufficient.',
         'Explain plausible candidates you ruled out and why. Do not pad the page.',
         'Return only the required structured output. Use status "verified" for age and location only when the official page explicitly supports it; use "open" for availability only when current official evidence supports it.',
@@ -468,16 +400,6 @@ async function runResearch(job, profile) {
     if (job.timedOut) throw new Error('The four-minute research time limit was reached.');
     if (!result.finalOutput) throw new Error('The research agent returned no structured results.');
     job.result = validateFinalOutput(job, result.finalOutput);
-    for (const opportunity of job.result.opportunities) {
-      const url = new URL(opportunity.availabilityEvidence.sourceUrl).toString();
-      if (job.savedUrls.has(url)) continue;
-      try {
-        const outcome = await updateSite(opportunity);
-        job.savedUrls.add(outcome.url);
-      } catch (error) {
-        console.error(JSON.stringify({ event: 'opportunity_save_failed', title: opportunity.title, error: safeError(error) }));
-      }
-    }
     job.status = 'completed';
     job.finishedAt = Date.now();
   } catch (error) {
@@ -579,7 +501,6 @@ const server = createServer(async (req, res) => {
       cancelled: false,
       timedOut: false,
       result: null,
-      savedUrls: new Set(),
       error: null,
     };
     jobs.set(job.id, job);
