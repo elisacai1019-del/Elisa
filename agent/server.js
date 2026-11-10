@@ -14,7 +14,7 @@ const PORT = Number(process.env.PORT || 8080);
 const MODEL = process.env.OPENAI_MODEL || 'gpt-6-astra';
 const MAX_SEARCHES = 10;
 const MAX_PAGE_READS = 15;
-const MAX_RUNTIME_MS = 4 * 60 * 1000;
+const MAX_RUNTIME_MS = 8 * 60 * 1000;
 const MAX_ACTIVE_JOBS = 4;
 const MAX_PAGE_BYTES = 1_000_000;
 const MAX_PAGE_TEXT_CHARS = 18_000;
@@ -289,12 +289,40 @@ function createResearchTools(job) {
     },
   });
 
-  return [searchTool, openPageTool];
+  const updateSiteTool = tool({
+    name: 'update_site',
+    description: 'Insert one opportunity into the site database after all three official-source checks pass. Use once for every opportunity you keep. Existing URLs are skipped.',
+    parameters: OpportunitySchema,
+    async execute(opportunity) {
+      writeToolLog(job, 'update_site', {
+        title: opportunity.title,
+        url: safeLogUrl(opportunity.availabilityEvidence.sourceUrl),
+      });
+      if (!isCheckedOpportunity(job, opportunity)) {
+        return JSON.stringify({ saved: false, error: 'Opportunity has not passed all official-source checks.' });
+      }
+      try {
+        return JSON.stringify(await saveOpportunity(job, opportunity));
+      } catch (error) {
+        const message = safeError(error);
+        console.error(JSON.stringify({
+          event: 'opportunity_save_failed',
+          jobId: job.id,
+          title: opportunity.title,
+          url: safeLogUrl(opportunity.availabilityEvidence.sourceUrl),
+          error: message,
+        }));
+        return JSON.stringify({ saved: false, error: message });
+      }
+    },
+  });
+
+  return [searchTool, openPageTool, updateSiteTool];
 }
 
 function safeError(error) {
   let message = error instanceof Error ? error.message : String(error);
-  for (const secret of [process.env.OPENAI_API_KEY, process.env.AGENT_SECRET]) {
+  for (const secret of [process.env.OPENAI_API_KEY, process.env.AGENT_SECRET, process.env.SUPABASE_SERVICE_KEY]) {
     if (secret) message = message.split(secret).join('[redacted]');
   }
   return message.slice(0, 500);
@@ -330,6 +358,85 @@ function isCheckedOpportunity(job, item) {
     && item.availabilityEvidence.status === 'open' && excerptWasRead(job, item.availabilityEvidence);
 }
 
+async function saveOpportunity(job, item) {
+  const url = new URL(item.availabilityEvidence.sourceUrl).toString();
+  if (job.savedUrls.has(url)) return { saved: false, duplicate: true, url, title: item.title };
+  if (job.saveAttempts.has(url)) return { saved: false, duplicate: true, url, title: item.title };
+  job.saveAttempts.add(url);
+
+  if (!isCheckedOpportunity(job, item)) {
+    throw new Error('Opportunity has not passed all official-source checks.');
+  }
+
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_KEY;
+  if (!supabaseUrl || !serviceKey) {
+    throw new Error('SUPABASE_URL and SUPABASE_SERVICE_KEY must be set to save opportunities.');
+  }
+
+  const row = {
+    title: item.title,
+    url,
+    source_excerpt: [
+      `Age eligibility: ${item.ageEvidence.excerpt}`,
+      `Location: ${item.locationEvidence.excerpt}`,
+      `Availability: ${item.availabilityEvidence.excerpt}`,
+    ].join('\n'),
+    why_it_fits: item.whyItFits,
+    status: 'new',
+  };
+  const endpoint = `${supabaseUrl.replace(/\/+$/, '')}/rest/v1/opportunities?on_conflict=url`;
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      apikey: serviceKey,
+      'content-type': 'application/json',
+      accept: 'application/json',
+      prefer: 'resolution=ignore-duplicates,return=representation',
+      'user-agent': 'ElisaOpportunityAgent/1.0',
+    },
+    body: JSON.stringify(row),
+    cache: 'no-store',
+    signal: AbortSignal.timeout(20_000),
+  });
+
+  const body = await response.text();
+  if (!response.ok) {
+    let detail = `HTTP ${response.status}`;
+    try {
+      const payload = JSON.parse(body);
+      if (payload.code) detail += ` (${payload.code})`;
+      if (payload.message) detail += `: ${payload.message}`;
+    } catch {
+      // Keep response details out of logs when the gateway returns non-JSON.
+    }
+    throw new Error(`Supabase opportunity insert failed: ${detail}`);
+  }
+
+  let inserted;
+  try {
+    inserted = body ? JSON.parse(body) : [];
+  } catch {
+    throw new Error('Supabase returned an unreadable insert response.');
+  }
+  if (!Array.isArray(inserted) || inserted.length === 0) {
+    job.savedUrls.add(url);
+    console.log(JSON.stringify({
+      event: 'opportunity_save_skipped_duplicate',
+      jobId: job.id,
+      title: item.title,
+      url: safeLogUrl(url),
+    }));
+    return { saved: false, duplicate: true, url, title: item.title };
+  }
+
+  const savedRow = inserted[0];
+  job.savedUrls.add(url);
+  job.savedRows.push(savedRow);
+  console.log(JSON.stringify({ event: 'opportunity_saved', jobId: job.id, row: savedRow }));
+  return { saved: true, row: savedRow };
+}
+
 function validateFinalOutput(job, value) {
   const parsed = FinalOutputSchema.parse(value);
   const opportunities = [];
@@ -357,7 +464,7 @@ async function runResearch(job, profile) {
   job.startedAt = Date.now();
   const deadlineTimer = setTimeout(() => {
     job.timedOut = true;
-    job.controller.abort(new Error('The four-minute research time limit was reached.'));
+    job.controller.abort(new Error('The eight-minute research time limit was reached.'));
   }, MAX_RUNTIME_MS);
   deadlineTimer.unref?.();
 
@@ -376,7 +483,7 @@ async function runResearch(job, profile) {
         'Verify age eligibility, geographic eligibility for the profile city, and that application/registration is open now or the event is upcoming. Missing evidence is not proof of eligibility. Exclude any candidate for which any criterion is unclear.',
         'When evidence is missing or an official source cannot be read, investigate with another search or official page before ruling the candidate out, until the tool budget is exhausted.',
         'Only use short, exact excerpts copied from the official page text. Give a source URL for each age, location, and availability excerpt.',
-        'Return fully verified opportunities directly in the structured output. Do not save them to any website or database.',
+        'Call update_site once for every fully verified opportunity you intend to keep, after reading official sources and confirming all three eligibility and availability checks. If the database reports a duplicate, keep the opportunity in the structured results anyway. Return the same structured output after saving.',
         'Never invent opportunities, dates, eligibility rules, deadlines, or openings. Return fewer than five when evidence is insufficient.',
         'Explain plausible candidates you ruled out and why. Do not pad the page.',
         'Return only the required structured output. Use status "verified" for age and location only when the official page explicitly supports it; use "open" for availability only when current official evidence supports it.',
@@ -397,9 +504,24 @@ async function runResearch(job, profile) {
       signal: job.controller.signal,
     });
     if (job.cancelled) return;
-    if (job.timedOut) throw new Error('The four-minute research time limit was reached.');
+    if (job.timedOut) throw new Error('The eight-minute research time limit was reached.');
     if (!result.finalOutput) throw new Error('The research agent returned no structured results.');
     job.result = validateFinalOutput(job, result.finalOutput);
+    for (const opportunity of job.result.opportunities) {
+      const url = new URL(opportunity.availabilityEvidence.sourceUrl).toString();
+      if (job.saveAttempts.has(url)) continue;
+      try {
+        await saveOpportunity(job, opportunity);
+      } catch (error) {
+        console.error(JSON.stringify({
+          event: 'opportunity_save_failed',
+          jobId: job.id,
+          title: opportunity.title,
+          url: safeLogUrl(url),
+          error: safeError(error),
+        }));
+      }
+    }
     job.status = 'completed';
     job.finishedAt = Date.now();
   } catch (error) {
@@ -407,7 +529,7 @@ async function runResearch(job, profile) {
     if (job.timedOut) {
       job.error = {
         code: 'time_limit_exceeded',
-        message: 'The four-minute research limit was reached before verified results were ready; no unverified partial results were returned.',
+        message: 'The eight-minute research limit was reached before verified results were ready; no unverified partial results were returned.',
       };
     } else {
       job.error = { code: 'research_failed', message: safeError(error) };
@@ -501,6 +623,9 @@ const server = createServer(async (req, res) => {
       cancelled: false,
       timedOut: false,
       result: null,
+      savedUrls: new Set(),
+      saveAttempts: new Set(),
+      savedRows: [],
       error: null,
     };
     jobs.set(job.id, job);
